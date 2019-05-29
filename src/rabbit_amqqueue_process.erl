@@ -917,9 +917,17 @@ requeue_and_run(AckTags, State = #q{backing_queue       = BQ,
     run_message_queue(maybe_send_drained(WasEmpty, drop_expired_msgs(State1))).
 
 fetch(AckRequired, State = #q{backing_queue       = BQ,
-                              backing_queue_state = BQS}) ->
+                              backing_queue_state = BQS,
+                              confirm_on          = ConfirmOn,
+                              msg_id_to_channel   = MTC}) ->
     {Result, BQS1} = BQ:fetch(AckRequired, BQS),
-    State1 = drop_expired_msgs(State#q{backing_queue_state = BQS1}),
+    MTC1 = case {ConfirmOn, Result, AckRequired} of
+        {ack, {#basic_message{id = MsgId}, _, _}, false} ->
+            confirm_messages([MsgId], MTC);
+        _ -> MTC
+    end,
+    State1 = drop_expired_msgs(State#q{backing_queue_state = BQS1,
+                                       msg_id_to_channel   = MTC1}),
     {Result, maybe_send_drained(Result =:= empty, State1)}.
 
 ack(AckTags, ChPid, State) ->
