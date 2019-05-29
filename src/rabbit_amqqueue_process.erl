@@ -512,10 +512,6 @@ init_confirm_on(<<"enqueue">>, State = #q{confirm_on = ack,
 init_confirm_on(_, State) ->
     State.
 
-confirm_all_messages(MTC) ->
-    MsgIds = gb_trees:keys(MTC),
-    confirm_messages(MsgIds, MTC).
-
 reply(Reply, NewState) ->
     {NewState1, Timeout} = next_state(NewState),
     {reply, Reply, ensure_stats_timer(ensure_rate_timer(NewState1)), Timeout}.
@@ -616,6 +612,38 @@ maybe_send_drained(WasEmpty, State) ->
     end,
     State.
 
+confirm_all_messages(MTC) ->
+    MsgIds = gb_trees:keys(MTC),
+    confirm_messages(MsgIds, MTC).
+
+reject_all_messages(MTC) ->
+    MsgIds = gb_trees:keys(MTC),
+    reject_messages(MsgIds, MTC).
+
+reject_messages([], MTC) ->
+    MTC;
+reject_messages(MsgIds, MTC) ->
+    {CMs, MTC1} =
+        lists:foldl(
+          fun(MsgId, {CMs, MTC0}) ->
+                  case gb_trees:lookup(MsgId, MTC0) of
+                      {value, {SenderPid, MsgSeqNo}} ->
+                          {rabbit_misc:gb_trees_cons(SenderPid,
+                                                     MsgSeqNo, CMs),
+                           gb_trees:delete(MsgId, MTC0)};
+                      none ->
+                          {CMs, MTC0}
+                  end
+          end, {gb_trees:empty(), MTC}, MsgIds),
+    rabbit_misc:gb_trees_foreach(
+        fun(Pid, MsgSeqNos) ->
+            %% TODO: batch reject
+            [gen_server2:cast(Pid, {reject_publish, MsgSeqNo, self()}) ||
+             MsgSeqNo <- MsgSeqNos]
+        end,
+        CMs),
+    MTC1.
+
 confirm_messages([], MTC) ->
     MTC;
 confirm_messages(MsgIds, MTC) ->
@@ -675,13 +703,26 @@ send_mandatory(#delivery{mandatory  = true,
                          msg_seq_no = MsgSeqNo}) ->
     gen_server2:cast(SenderPid, {mandatory_received, MsgSeqNo}).
 
-discard(#delivery{confirm = Confirm,
-                  sender  = SenderPid,
-                  flow    = Flow,
-                  message = #basic_message{id = MsgId}}, BQ, BQS, MTC) ->
+discard_and_confirm(#delivery{confirm = Confirm,
+                              sender  = SenderPid,
+                              flow    = Flow,
+                              message = #basic_message{id = MsgId}},
+                    BQ, BQS, MTC) ->
     %% TODO: why does discard confirm a message?
     MTC1 = case Confirm of
                true  -> confirm_messages([MsgId], MTC);
+               false -> MTC
+           end,
+    BQS1 = BQ:discard(MsgId, SenderPid, Flow, BQS),
+    {BQS1, MTC1}.
+
+discard_and_reject(#delivery{confirm = Confirm,
+                             sender  = SenderPid,
+                             flow    = Flow,
+                             message = #basic_message{id = MsgId}},
+                    BQ, BQS, MTC) ->
+    MTC1 = case Confirm of
+               true  -> reject_messages([MsgId], MTC);
                false -> MTC
            end,
     BQS1 = BQ:discard(MsgId, SenderPid, Flow, BQS),
@@ -720,7 +761,7 @@ attempt_delivery(Delivery = #delivery{sender  = SenderPid,
                                 Message, Props, SenderPid, Flow, BQS),
                           {{Message, Delivered, AckTag}, {BQS1, MTC}};
                (false) -> {{Message, Delivered, undefined},
-                           discard(Delivery, BQ, BQS, MTC)}
+                           discard_and_confirm(Delivery, BQ, BQS, MTC)}
            end, qname(State), State#q.consumers, State#q.single_active_consumer_on, State#q.active_consumer) of
         {delivered, ActiveConsumersChanged, {BQS1, MTC1}, Consumers} ->
             {delivered,   maybe_notify_decorators(
@@ -771,10 +812,17 @@ deliver_or_enqueue(Delivery = #delivery{message = Message,
             State2;
         %% The next one is an optimisation
         {undelivered, State2 = #q{ttl = 0, dlx = undefined,
+                                  backing_queue       = BQ,
                                   backing_queue_state = BQS,
-                                  msg_id_to_channel   = MTC}} ->
-            %% TODO: reject if confirm_on = ack
-            {BQS1, MTC1} = discard(Delivery, BQ, BQS, MTC),
+                                  msg_id_to_channel   = MTC,
+                                  confirm_on          = ConfirmOn}} ->
+            {BQS1, MTC1} = case ConfirmOn of
+                enqueue ->
+                    discard_and_confirm(Delivery, BQ, BQS, MTC);
+                ack ->
+                    discard_and_reject(Delivery, BQ, BQS, MTC)
+            end,
+
             State2#q{backing_queue_state = BQS1, msg_id_to_channel = MTC1};
         {undelivered, State2 = #q{backing_queue_state = BQS}} ->
 
@@ -818,7 +866,7 @@ maybe_drop_head(AlreadyDropped, State = #q{backing_queue       = BQ,
                                     {DropResult, BQS1} = BQ:drop(false, BQS),
                                     case {DropResult, ConfirmOn} of
                                         {{MsgId, _}, ack} ->
-                                            MTC1 = confirm_messages([MsgId], MTC),
+                                            MTC1 = reject_messages([MsgId], MTC),
                                             State#q{backing_queue_state = BQS1,
                                                     msg_id_to_channel = MTC1};
                                         _ ->
@@ -829,23 +877,12 @@ maybe_drop_head(AlreadyDropped, State = #q{backing_queue       = BQ,
             {AlreadyDropped, State}
     end.
 
-send_reject_publish(#delivery{confirm = true,
-                              flow = Flow,
-                              sender = SenderPid,
-                              msg_seq_no = MsgSeqNo,
-                              message = #basic_message{id = MsgId}},
+send_reject_publish(#delivery{confirm = true} = Delivery,
                     _Delivered,
                     State = #q{backing_queue = BQ,
                                backing_queue_state = BQS,
                                msg_id_to_channel   = MTC}) ->
-    gen_server2:cast(SenderPid, {reject_publish, MsgSeqNo, self()}),
-
-    MTC1 = case gb_trees:is_defined(MsgId, MTC) of
-        true  -> gb_trees:delete(MsgId, MTC);
-        false -> MTC
-    end,
-    BQS1 = BQ:discard(MsgId, SenderPid, Flow, BQS),
-
+    {BQS1, MTC1} = discard_and_reject(Delivery, BQ, BQS, MTC),
     State#q{backing_queue_state = BQS1, msg_id_to_channel = MTC1};
 send_reject_publish(#delivery{confirm = false},
                       _Delivered, State) ->
@@ -893,7 +930,6 @@ ack(AckTags, ChPid, State) ->
                                    confirm_on          = ConfirmOn,
                                    msg_id_to_channel   = MTC}) ->
                         {MsgIds, BQS1} = BQ:ack(AckTags, BQS),
-                        rabbit_log_queue:error("Ack tags ~p message ids ~p~n", [AckTags, MsgIds]),
                         case ConfirmOn of
                             ack ->
                                 MTC1 = confirm_messages(MsgIds, MTC),
@@ -1064,7 +1100,7 @@ delete_expired_msgs(ExpirePred, State = #q{backing_queue_state = BQS,
                       end,
                       [], BQS),
     {MsgIds, BQS2} = BQ:ack(Acks, BQS1),
-    MTC1 = confirm_messages(MsgIds, MTC),
+    MTC1 = reject_messages(MsgIds, MTC),
     {Res, State#q{backing_queue_state = BQS2,
                   msg_id_to_channel = MTC1}};
 delete_expired_msgs(ExpirePred, State = #q{backing_queue_state = BQS,
@@ -1116,7 +1152,7 @@ dead_letter_msgs(Fun, Reason, X, State = #q{dlx_routing_key     = RK,
     {MsgIds, BQS2} = BQ:ack(Acks, BQS1),
     case ConfirmOn of
         ack ->
-            MTC1 = confirm_messages(MsgIds, MTC),
+            MTC1 = reject_messages(MsgIds, MTC),
             {Res, State#q{backing_queue_state = BQS2,
                           msg_id_to_channel = MTC1}};
         enqueue ->
@@ -1512,7 +1548,7 @@ handle_call(purge, _From, State = #q{backing_queue       = BQ,
     %% TODO: test race between purge and confirm in enqueue mode
     State1 = case ConfirmOn of
         ack ->
-            confirm_all_messages(MTC),
+            reject_all_messages(MTC),
             State#q{backing_queue_state = BQS1,
                     msg_id_to_channel = gb_trees:empty()};
         _ ->
