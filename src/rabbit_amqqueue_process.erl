@@ -507,7 +507,7 @@ init_confirm_on(<<"enqueue">>, State = #q{confirm_on = ack,
                                           msg_id_to_channel = MTC}) ->
     %% TODO: only confirm enqueued messages.
     confirm_all_messages(MTC),
-    State#q{msg_id_to_channel = gb_trees:new(),
+    State#q{msg_id_to_channel = gb_trees:empty(),
             confirm_on = enqueue};
 init_confirm_on(_, State) ->
     State.
@@ -805,7 +805,9 @@ maybe_drop_head(State = #q{overflow = 'drop-head'}) ->
     maybe_drop_head(false, State).
 
 maybe_drop_head(AlreadyDropped, State = #q{backing_queue       = BQ,
-                                           backing_queue_state = BQS}) ->
+                                           backing_queue_state = BQS,
+                                           confirm_on          = ConfirmOn,
+                                           msg_id_to_channel   = MTC}) ->
     case over_max_length(State) of
         true ->
             maybe_drop_head(true,
@@ -813,8 +815,15 @@ maybe_drop_head(AlreadyDropped, State = #q{backing_queue       = BQ,
                               State#q.dlx,
                               fun (X) -> dead_letter_maxlen_msg(X, State) end,
                               fun () ->
-                                      {_, BQS1} = BQ:drop(false, BQS),
-                                      State#q{backing_queue_state = BQS1}
+                                    {DropResult, BQS1} = BQ:drop(false, BQS),
+                                    case {DropResult, ConfirmOn} of
+                                        {{MsgId, _}, ack} ->
+                                            MTC1 = confirm_messages([MsgId], MTC),
+                                            State#q{backing_queue_state = BQS1,
+                                                    msg_id_to_channel = MTC1};
+                                        _ ->
+                                            State#q{backing_queue_state = BQS1}
+                                    end
                               end));
         false ->
             {AlreadyDropped, State}
