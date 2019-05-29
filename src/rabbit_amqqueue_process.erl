@@ -1040,19 +1040,37 @@ drop_expired_msgs(State) ->
                                    State)
     end.
 
-drop_expired_msgs(Now, State = #q{backing_queue_state = BQS,
-                                  backing_queue       = BQ }) ->
+drop_expired_msgs(Now, State) ->
     ExpirePred = fun (#message_properties{expiry = Exp}) -> Now >= Exp end,
     {Props, State1} =
         with_dlx(
           State#q.dlx,
           fun (X) -> dead_letter_expired_msgs(ExpirePred, X, State) end,
-          fun () -> {Next, BQS1} = BQ:dropwhile(ExpirePred, BQS),
-                    {Next, State#q{backing_queue_state = BQS1}} end),
+          fun ()  -> delete_expired_msgs(ExpirePred, State) end),
     ensure_ttl_timer(case Props of
                          undefined                         -> undefined;
                          #message_properties{expiry = Exp} -> Exp
                      end, State1).
+
+
+delete_expired_msgs(ExpirePred, State = #q{backing_queue_state = BQS,
+                                           backing_queue       = BQ,
+                                           confirm_on          = ack,
+                                           msg_id_to_channel   = MTC}) ->
+    {Res, Acks, BQS1} =
+        BQ:fetchwhile(ExpirePred,
+                      fun(_, AckTag, AckTags) ->
+                          [AckTag | AckTags]
+                      end,
+                      [], BQS),
+    {MsgIds, BQS2} = BQ:ack(Acks, BQS1),
+    MTC1 = confirm_messages(MsgIds, MTC),
+    {Res, State#q{backing_queue_state = BQS2,
+                  msg_id_to_channel = MTC1}};
+delete_expired_msgs(ExpirePred, State = #q{backing_queue_state = BQS,
+                                           backing_queue       = BQ}) ->
+    {Next, BQS1} = BQ:dropwhile(ExpirePred, BQS),
+    {Next, State#q{backing_queue_state = BQS1}}.
 
 with_dlx(undefined, _With,  Without) -> Without();
 with_dlx(DLX,        With,  Without) -> case rabbit_exchange:lookup(DLX) of
@@ -1089,13 +1107,13 @@ dead_letter_msgs(Fun, Reason, X, State = #q{dlx_routing_key     = RK,
                                             confirm_on          = ConfirmOn,
                                             msg_id_to_channel   = MTC}) ->
     QName = qname(State),
-    {Res, Acks1, BQS1} =
+    {Res, Acks, BQS1} =
         Fun(fun (Msg, AckTag, Acks) ->
                     rabbit_dead_letter:publish(Msg, Reason, X, RK, QName),
                     [AckTag | Acks]
             end, [], BQS),
     %% TODO: should the message be rejected if it's dead-lettered
-    {MsgIds, BQS2} = BQ:ack(Acks1, BQS1),
+    {MsgIds, BQS2} = BQ:ack(Acks, BQS1),
     case ConfirmOn of
         ack ->
             MTC1 = confirm_messages(MsgIds, MTC),
@@ -1487,9 +1505,19 @@ handle_call({delete, IfUnused, IfEmpty, ActingUser}, _From,
     end;
 
 handle_call(purge, _From, State = #q{backing_queue       = BQ,
-                                     backing_queue_state = BQS}) ->
+                                     backing_queue_state = BQS,
+                                     confirm_on          = ConfirmOn,
+                                     msg_id_to_channel   = MTC}) ->
     {Count, BQS1} = BQ:purge(BQS),
-    State1 = State#q{backing_queue_state = BQS1},
+    %% TODO: test race between purge and confirm in enqueue mode
+    State1 = case ConfirmOn of
+        ack ->
+            confirm_all_messages(MTC),
+            State#q{backing_queue_state = BQS1,
+                    msg_id_to_channel = gb_trees:empty()};
+        _ ->
+            State#q{backing_queue_state = BQS1}
+    end,
     reply({ok, Count}, maybe_send_drained(Count =:= 0, State1));
 
 handle_call({requeue, AckTags, ChPid}, From, State) ->
