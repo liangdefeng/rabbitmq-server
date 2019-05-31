@@ -62,7 +62,7 @@
             expiry_timer_ref,
             %% stats emission timer
             stats_timer,
-            %% a tuple of two gb_trees, which map message IDs to {channel pid, MsgSeqNo} pairs
+            %% a tuple of two maps, which map message IDs to {channel pid, MsgSeqNo} pairs
             %% first element contains messages not confirmed by the backing queue
             %% second element contains messages confirmed by the backing queue
             %% second element is empty if confirm_on is set to enqueue
@@ -167,7 +167,7 @@ init_state(Q) ->
                has_had_consumers         = false,
                consumers                 = rabbit_queue_consumers:new(),
                senders                   = pmon:new(delegate),
-               msg_id_to_channel         = {gb_trees:empty(), gb_trees:empty()},
+               msg_id_to_channel         = {#{}, #{}},
                status                    = running,
                args_policy_version       = 0,
                overflow                  = 'drop-head',
@@ -266,7 +266,7 @@ recovery_barrier(BarrierPid) ->
 
 -spec init_with_backing_queue_state
         (amqqueue:amqqueue(), atom(), tuple(), any(),
-         [rabbit_types:delivery()], pmon:pmon(), gb_trees:tree()) ->
+         [rabbit_types:delivery()], pmon:pmon(), maps:map()) ->
             #q{}.
 
 init_with_backing_queue_state(Q, BQ, BQS,
@@ -281,7 +281,7 @@ init_with_backing_queue_state(Q, BQ, BQS,
                      backing_queue_state = BQS,
                      rate_timer_ref      = RateTRef,
                      senders             = Senders,
-                     msg_id_to_channel   = {MTC, gb_trees:empty()}},
+                     msg_id_to_channel   = {MTC, #{}}},
     State2 = process_args_policy(State1),
     State3 = lists:foldl(fun (Delivery, StateN) ->
                                  maybe_deliver_or_enqueue(Delivery, true, StateN)
@@ -508,7 +508,7 @@ init_confirm_on(<<"ack">>, State = #q{confirm_on = enqueue}) ->
 init_confirm_on(<<"enqueue">>, State = #q{confirm_on = ack,
                                           msg_id_to_channel = MTC = {_, MTCC}}) ->
     %% TODO: only confirm enqueued messages.
-    MsgIds = gb_trees:keys(MTCC),
+    MsgIds = maps:keys(MTCC),
     MTC1 = confirm_messages(MsgIds, MTC),
     State#q{msg_id_to_channel = MTC1,
             confirm_on = enqueue};
@@ -544,11 +544,11 @@ next_state(State = #q{backing_queue       = BQ,
 mark_messages_confirmed(MsgIds, {MTCU0, MTCC0}) ->
     lists:foldl(
         fun(MsgId, {MTCU, MTCC}) ->
-            case gb_trees:lookup(MsgId, MTCU) of
+            case maps:get(MsgId, MTCU, none) of
                 none -> {MTCU, MTCC};
-                {value, Val} ->
-                    {gb_trees:delete(MsgId, MTCU),
-                     gb_trees:insert(MsgId, Val, MTCC)}
+                Val ->
+                    {maps:remove(MsgId, MTCU),
+                     maps:put(MsgId, Val, MTCC)}
             end
         end,
         {MTCU0, MTCC0},
@@ -630,7 +630,7 @@ maybe_send_drained(WasEmpty, State) ->
     State.
 
 reject_all_messages({MTCU, MTCC} = MTC) ->
-    MsgIds = gb_trees:keys(MTCU) ++ gb_trees:keys(MTCC),
+    MsgIds = maps:keys(MTCU) ++ maps:keys(MTCC),
     reject_messages(MsgIds, MTC).
 
 reject_messages([], MTC) ->
@@ -638,20 +638,23 @@ reject_messages([], MTC) ->
 reject_messages(MsgIds, {MTCU, MTCC}) ->
     {CMUs, MTCU1} = select_cms(MsgIds, MTCU),
     {CMCs, MTCC1} = select_cms(MsgIds, MTCC),
-    rabbit_misc:gb_trees_foreach(
-        fun(Pid, MsgSeqNos) ->
+    maps:fold(
+        fun(Pid, MsgSeqNos, _) ->
             %% TODO: batch reject
             [gen_server2:cast(Pid, {reject_publish, MsgSeqNo, self()}) ||
-             MsgSeqNo <- MsgSeqNos]
+             MsgSeqNo <- MsgSeqNos],
+            ok
         end,
+        ok,
         CMUs),
-
-    rabbit_misc:gb_trees_foreach(
-        fun(Pid, MsgSeqNos) ->
+    maps:fold(
+        fun(Pid, MsgSeqNos, _) ->
             %% TODO: batch reject
             [gen_server2:cast(Pid, {reject_publish, MsgSeqNo, self()}) ||
-             MsgSeqNo <- MsgSeqNos]
+             MsgSeqNo <- MsgSeqNos],
+            ok
         end,
+        ok,
         CMCs),
     {MTCU1, MTCC1}.
 
@@ -660,23 +663,37 @@ confirm_messages([], MTC) ->
 confirm_messages(MsgIds, {MTCU, MTCC}) ->
     {CMUs, MTCU1} = select_cms(MsgIds, MTCU),
     {CMCs, MTCC1} = select_cms(MsgIds, MTCC),
-    rabbit_misc:gb_trees_foreach(fun rabbit_misc:confirm_to_sender/2, CMUs),
-    rabbit_misc:gb_trees_foreach(fun rabbit_misc:confirm_to_sender/2, CMCs),
+    maps:fold(
+        fun(Pid, MsgSeqNos, _) ->
+            rabbit_misc:confirm_to_sender(Pid, MsgSeqNos)
+        end,
+        ok,
+        CMUs),
+    maps:fold(
+        fun(Pid, MsgSeqNos, _) ->
+            rabbit_misc:confirm_to_sender(Pid, MsgSeqNos)
+        end,
+        ok,
+        CMCs),
     {MTCU1, MTCC1}.
 
-select_cms(MsgIds, MTCGbTree0) ->
+select_cms(MsgIds, MTCMap0) ->
     lists:foldl(
-        fun(MsgId, {CMs, MTCGbTree}) ->
-            case gb_trees:lookup(MsgId, MTCGbTree) of
-                {value, {SenderPid, MsgSeqNo}} ->
-                    {rabbit_misc:gb_trees_cons(SenderPid,
-                                               MsgSeqNo, CMs),
-                     gb_trees:delete(MsgId, MTCGbTree)};
+        fun(MsgId, {CMs, MTCMap}) ->
+            case maps:get(MsgId, MTCMap, none) of
                 none ->
-                    {CMs, MTCGbTree}
+                    {CMs, MTCMap};
+                {SenderPid, MsgSeqNo} ->
+                    {maps:update_with(SenderPid,
+                                      fun(MsgSeqNos) ->
+                                          [MsgSeqNo | MsgSeqNos]
+                                      end,
+                                      [MsgSeqNo],
+                                      CMs),
+                     maps:remove(MsgId, MTCMap)}
             end
         end,
-        {gb_trees:empty(), MTCGbTree0},
+        {#{}, MTCMap0},
         MsgIds).
 
 send_or_record_confirm(#delivery{confirm    = false}, State) ->
@@ -691,9 +708,9 @@ send_or_record_confirm(#delivery{confirm    = true,
                                   msg_id_to_channel = {MTCU, MTCC}}) ->
     MTC1 = case ?amqqueue_is_durable(Q) andalso IsPersistent of
         true ->
-            {gb_trees:insert(MsgId, {SenderPid, MsgSeqNo}, MTCU), MTCC};
+            {maps:put(MsgId, {SenderPid, MsgSeqNo}, MTCU), MTCC};
         false ->
-            {MTCU, gb_trees:insert(MsgId, {SenderPid, MsgSeqNo}, MTCC)}
+            {MTCU, maps:put(MsgId, {SenderPid, MsgSeqNo}, MTCC)}
     end,
     {eventually, State#q{msg_id_to_channel = MTC1}};
 send_or_record_confirm(#delivery{confirm    = true,
@@ -706,7 +723,7 @@ send_or_record_confirm(#delivery{confirm    = true,
                                   confirm_on        = enqueue,
                                   msg_id_to_channel = {MTCU, MTCC}})
   when ?amqqueue_is_durable(Q) ->
-    MTCU1 = gb_trees:insert(MsgId, {SenderPid, MsgSeqNo}, MTCU),
+    MTCU1 = maps:put(MsgId, {SenderPid, MsgSeqNo}, MTCU),
     {eventually, State#q{msg_id_to_channel = {MTCU1, MTCC}}};
 send_or_record_confirm(#delivery{confirm    = true,
                                  sender     = SenderPid,
@@ -749,19 +766,13 @@ discard_and_reject_delivery(#delivery{confirm    = Confirm,
     MTC1 = case Confirm of
                true  ->
                    gen_server2:cast(SenderPid, {reject_publish, MsgSeqNo, self()}),
-                   {gb_trees_delete(MsgId, MTCU),
-                    gb_trees_delete(MsgId, MTCC)};
+                   {maps:remove(MsgId, MTCU),
+                    maps:remove(MsgId, MTCC)};
                false ->
                    {MTCU, MTCC}
            end,
     BQS1 = BQ:discard(MsgId, SenderPid, Flow, BQS),
     {BQS1, MTC1}.
-
-gb_trees_delete(Key, Tree) ->
-    case gb_trees:lookup(Key, Tree) of
-        {value, _} -> gb_trees:delete(Key, Tree);
-        _ -> Tree
-    end.
 
 run_message_queue(State) -> run_message_queue(false, State).
 
